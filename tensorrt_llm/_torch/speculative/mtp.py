@@ -1183,7 +1183,7 @@ class MTPEagleWorker(MTPWorker):
                                              accepted_tokens=accepted_tokens,
                                              attn_metadata=attn_metadata,
                                              spec_metadata=spec_metadata)
-
+        target_hidden_full = inputs["hidden_states"]
         # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
@@ -1206,6 +1206,7 @@ class MTPEagleWorker(MTPWorker):
                                       attn_metadata.num_ctx_tokens)
                     gather_ids = torch.concat(
                         [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
+                    target_hidden_gathered = target_hidden_full[gather_ids]
                 else:
                     hidden_states = draft_model.mtp_layers[0](
                         embed_tokens=draft_model.embed_tokens,
@@ -1309,7 +1310,7 @@ class MTPEagleWorker(MTPWorker):
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,
-                    "hidden_states": hidden_states,
+                    "hidden_states": target_hidden_gathered,
                     "attn_metadata": attn_metadata,
                 }
 
