@@ -1946,6 +1946,118 @@ class DSATrtllmAttention(TrtllmAttention):
         """No-op KV prediction; DSA uses indexer-based selection instead."""
         return None, None
 
+    def forward(self, q, k, v, metadata, *args, **kwargs):
+        # FA3 fast-path: route DSA decode-only to FlashAttention-3 paged-KV
+        # with topk page_table — mirrors SGLang's NSA `fa3` decode_impl
+        # (nsa_backend.py:_forward_fa3). Gated by env var so we can A/B-test
+        # against the default sparse_attn_fwd_kernel path.
+        import os
+        from tensorrt_llm._torch.attention_backend.interface import \
+            AttentionInputType
+        if (os.environ.get('TRTLLM_DSA_FA3_DECODE') == '1'
+                and kwargs.get('attention_input_type')
+                == AttentionInputType.generation_only
+                and metadata.num_generations > 0
+                and metadata.num_contexts == 0):
+            try:
+                fa3_out = self._forward_fa3_decode(q, metadata, **kwargs)
+                if fa3_out is not None:
+                    output = kwargs.get('output')
+                    if output is not None:
+                        output.copy_(fa3_out)
+                        return output
+                    return fa3_out
+            except Exception as e:
+                logger.warning(
+                    f"[DSA-FA3] decode failed, falling back to parent: {e}")
+        return super().forward(q, k, v, metadata, *args, **kwargs)
+
+    def _forward_fa3_decode(self, q, metadata, *, topk_indices=None, **kwargs):
+        """FA3 paged-KV decode with topk page_table.
+
+        Returns None to fall back to parent if pre-conditions aren't met
+        (FA3 not installed, missing topk_indices, etc.).
+        """
+        try:
+            from flash_attn_interface import flash_attn_with_kvcache
+        except ImportError:
+            logger.warning("[DSA-FA3] flash_attn_interface not installed")
+            return None
+        if topk_indices is None:
+            return None
+
+        # Convert per-request topk → flat-pool indices. Side-effect:
+        # populates metadata._cached_pool_view (shape: total_slots, 1, head_dim).
+        # Indices use stride_factor = num_layers * tokens_per_block, baking in
+        # the layer-id offset, so they index into the multi-layer flat pool.
+        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
+            topk_indices, metadata, self.get_local_layer_idx(metadata),
+            is_generation=True)
+
+        pool_view = metadata._cached_pool_view  # (total_slots, 1, 576)
+        total_slots = pool_view.shape[0]
+        head_dim = pool_view.shape[-1]
+        kv_lora_rank = self.mla_params.kv_lora_rank
+        qk_rope_dim = self.mla_params.qk_rope_head_dim
+        assert head_dim == kv_lora_rank + qk_rope_dim
+
+        # FA3 expects (num_pages, page_block_size, num_heads_k, head_dim).
+        # Each page = 1 token slot in our flat view.
+        v_cache = pool_view[..., :kv_lora_rank].view(total_slots, 1, 1,
+                                                    kv_lora_rank)
+        k_cache = pool_view[..., kv_lora_rank:].view(total_slots, 1, 1,
+                                                    qk_rope_dim)
+
+        # Q reshape from flat (total_q, h, head_dim) to (B, s_q, h, head_dim).
+        num_gen = metadata.num_generations
+        s_q = q.shape[0] // num_gen
+        if q.dim() == 2:
+            q = q.view(-1, self.num_heads, head_dim)
+        num_heads_q = q.shape[1]
+        q_total = q.view(num_gen, s_q, num_heads_q, head_dim)
+        q_nope = q_total[..., :kv_lora_rank].contiguous()
+        q_rope = q_total[..., kv_lora_rank:].contiguous()
+
+        device = q.device
+        cache_seqlens = metadata.kv_lens_cuda_runtime[
+            metadata.num_contexts:metadata.num_contexts + num_gen].to(
+                torch.int32)
+        cu_seqlens_q = torch.arange(0, (num_gen + 1) * s_q,
+                                    s_q,
+                                    dtype=torch.int32,
+                                    device=device)
+        cu_seqlens_k_new = torch.zeros(num_gen + 1,
+                                      dtype=torch.int32,
+                                      device=device)
+
+        # softmax_scale matches attentionOp.cpp:1178
+        q_scaling = self.q_scaling or 1.0
+        softmax_scale = 1.0 / (q_scaling * math.sqrt(
+            self.mla_params.qk_nope_head_dim
+            + self.mla_params.qk_rope_head_dim))
+
+        out = flash_attn_with_kvcache(
+            q=q_rope,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            qv=q_nope,
+            page_table=topk_indices_global,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=s_q,
+            softmax_scale=softmax_scale,
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=False,
+        )
+
+        # FA3 returns (B, s_q, num_heads_q, kv_lora_rank). Parent's output is
+        # flat (total_q_tokens, num_heads_q * v_head_dim). In MLA absorbed
+        # mode the V output dim equals kv_lora_rank.
+        return out.reshape(num_gen * s_q,
+                          num_heads_q * kv_lora_rank).contiguous()
+
     def mla_rope_append_paged_kv_assign_q(
         self,
         q: torch.Tensor,
